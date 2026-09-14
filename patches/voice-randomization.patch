@@ -1,0 +1,135 @@
+--- a/src/main/java/com/vnap/dialogue/ContextualDialogueController.java
++++ b/src/main/java/com/vnap/dialogue/ContextualDialogueController.java
+@@ -65,7 +65,9 @@
+ import java.time.DayOfWeek;
+ import java.time.LocalDate;
+ import java.time.LocalDateTime;
++import java.util.ArrayDeque;
+ import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -94,6 +96,7 @@
+ 	private static final Map<UUID, Map<String, Integer>> VILLAGER_INVENTORIES = new HashMap<>();
+ 	private static final Map<UUID, SpeechTarget> SPEECH_TARGETS = new HashMap<>();
+ 	private static final Map<String, List<Integer>> SHARED_RECENT_VARIANTS = new HashMap<>();
++	private static final Map<String, VariantShuffleBag> VARIANT_SHUFFLE_BAGS = new HashMap<>();
+ 	private static final Map<UUID, Long> NO_WORKSTATION_SINCE = new HashMap<>();
+ 	private static final Map<UUID, Long> LAST_DANGER = new HashMap<>();
+ 	private static final Map<UUID, Long> NO_BELL_SINCE = new HashMap<>();
+@@ -607,6 +610,7 @@
+ 		VILLAGER_INVENTORIES.clear();
+ 		SPEECH_TARGETS.clear();
+ 		SHARED_RECENT_VARIANTS.clear();
++		VARIANT_SHUFFLE_BAGS.clear();
+ 		NO_WORKSTATION_SINCE.clear();
+ 		LAST_DANGER.clear();
+ 		NO_BELL_SINCE.clear();
+@@ -992,7 +996,7 @@
+ 			case SUNDAY -> ticks / LONG_COOLDOWN % 2L == 0L ? "uzvatl" : "zckxrc";
+ 		});
+ 		if (choices.size() == 1) choices.add("lvigit");
+-		return choices.get(Math.floorMod((int) (ticks / LONG_COOLDOWN), choices.size()));
++		return choices.get(ThreadLocalRandom.current().nextInt(choices.size()));
+ 	}
+ 
+ 	private static String playerContext(ServerPlayer player, Villager villager) {
+@@ -2119,12 +2123,15 @@
+ 				|| isBusy(speaker)
+ 				|| !ready(cooldownKey, VillagerNewsSettings.scaleCooldown(cooldown))) return false;
+ 		List<Integer> recentVariants = SHARED_RECENT_VARIANTS.getOrDefault(group.id(), List.of());
+-		DialogueCatalog.DialogueVariant variant = group.chooseVariant(VillagerNewsSettings.rareVoicelines(), Set.copyOf(recentVariants));
++		int rareMode = VillagerNewsSettings.rareVoicelines();
++		DialogueCatalog.DialogueVariant variant = VARIANT_SHUFFLE_BAGS
++			.computeIfAbsent(group.id(), ignored -> new VariantShuffleBag())
++			.next(group, rareMode, Set.copyOf(recentVariants));
+ 		if (variant == null) return false;
+ 		DialogueAnimationNetwork.send(level, speaker, group.id(), variant.index(), (int) variant.durationTicks());
+ 		ACTIVE_SOUNDS.put(speaker.getUUID(), new ActiveSound(group.id(), ticks + variant.durationTicks()));
+ 		COOLDOWNS.put(cooldownKey, ticks);
+-		int historySize = Math.min(3, group.variants().size() - 1);
++		int historySize = Math.min(5, group.variants().size() - 1);
+ 		if (historySize > 0) {
+ 			List<Integer> updatedHistory = new ArrayList<>(recentVariants);
+ 			updatedHistory.remove(Integer.valueOf(variant.index()));
+@@ -2453,6 +2460,80 @@
+ 		}
+ 	}
+ 
++	private static final class VariantShuffleBag {
++		private final ArrayDeque<Integer> entries = new ArrayDeque<>();
++		private int mode = Integer.MIN_VALUE;
++
++		DialogueCatalog.DialogueVariant next(DialogueCatalog.DialogueGroup group, int rareMode, Set<Integer> excluded) {
++			if (mode != rareMode || entries.isEmpty()) refill(group, rareMode);
++			if (entries.isEmpty()) return group.chooseVariant(rareMode, excluded);
++
++			int attempts = entries.size();
++			while (attempts-- > 0) {
++				int index = entries.removeFirst();
++				if (excluded.contains(index)) {
++					entries.addLast(index);
++					continue;
++				}
++				DialogueCatalog.DialogueVariant chosen = findVariant(group, index);
++				if (chosen != null) return chosen;
++			}
++
++			DialogueCatalog.DialogueVariant fallback = group.chooseVariant(rareMode, excluded);
++			return fallback != null ? fallback : group.chooseVariant(rareMode);
++		}
++
++		private void refill(DialogueCatalog.DialogueGroup group, int rareMode) {
++			entries.clear();
++			mode = rareMode;
++			if (group.variants().isEmpty()) return;
++
++			int minimum = group.variants().stream().mapToInt(DialogueCatalog.DialogueVariant::weight).min().orElse(1);
++			int maximum = group.variants().stream().mapToInt(DialogueCatalog.DialogueVariant::weight).max().orElse(1);
++			List<Integer> weights = new ArrayList<>(group.variants().size());
++			int gcd = 0;
++			for (DialogueCatalog.DialogueVariant variant : group.variants()) {
++				int weight = effectiveWeight(variant.weight(), minimum, maximum, rareMode);
++				weights.add(weight);
++				if (weight > 0) gcd = gcd == 0 ? weight : gcd(gcd, weight);
++			}
++			if (gcd <= 0) gcd = 1;
++
++			List<Integer> refill = new ArrayList<>();
++			for (int i = 0; i < group.variants().size(); i++) {
++				int weight = weights.get(i);
++				if (weight <= 0) continue;
++				int copies = Math.max(1, weight / gcd);
++				for (int copy = 0; copy < copies; copy++) refill.add(group.variants().get(i).index());
++			}
++			Collections.shuffle(refill, ThreadLocalRandom.current());
++			entries.addAll(refill);
++		}
++
++		private static DialogueCatalog.DialogueVariant findVariant(DialogueCatalog.DialogueGroup group, int index) {
++			for (DialogueCatalog.DialogueVariant variant : group.variants()) {
++				if (variant.index() == index) return variant;
++			}
++			return null;
++		}
++
++		private static int effectiveWeight(int weight, int minimum, int maximum, int rareMode) {
++			if (rareMode == 0 && weight < maximum * 0.8) return 0;
++			if (rareMode == 2) return maximum + minimum - weight;
++			return Math.max(0, weight);
++		}
++
++		private static int gcd(int a, int b) {
++			while (b != 0) {
++				int next = a % b;
++				a = b;
++				b = next;
++			}
++			return Math.abs(a);
++		}
++	}
++
+ 	private static final class PlayerObservation {
+ 		private Vec3 lastPosition = Vec3.ZERO;
+ 		private int stillTicks;
