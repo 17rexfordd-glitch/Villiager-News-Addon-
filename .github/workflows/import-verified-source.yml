@@ -1,0 +1,121 @@
+name: Import verified Villager News source
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/import-verified-source.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  import-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 0
+
+      - name: Checkout verified port build harness
+        uses: actions/checkout@v4
+        with:
+          repository: 17rexfordd-glitch/CT-BN-Compat
+          ref: scratch/vnap-neoforge-port-build
+          path: harness
+
+      - name: Checkout upstream 1.3.3 source base
+        uses: actions/checkout@v4
+        with:
+          repository: MarcYohannTheScripter/villager-news-addon-port
+          ref: 0fe248be7656e08dc71e34f229ecd86548ae8310
+          path: vnap
+
+      - name: Reconstruct exact tested randomized 1.3.4 NeoForge port
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git -C vnap apply "$GITHUB_WORKSPACE/harness/scratch/vnap-neoforge.patch"
+
+          cat \
+            harness/scratch/vnap-full.patch.gz.b64.part00 \
+            harness/scratch/vnap-full.patch.gz.b64.part01 \
+            harness/scratch/vnap-full.patch.gz.b64.part02a \
+            harness/scratch/vnap-full.patch.gz.b64.part02b1 \
+            harness/scratch/vnap-full.patch.gz.b64.part02b2_0 \
+            harness/scratch/vnap-full.patch.gz.b64.part02b2_1 \
+            harness/scratch/vnap-full.patch.gz.b64.part02b2_2 \
+            harness/scratch/vnap-full.patch.gz.b64.part02b2_3 \
+            harness/scratch/vnap-full.patch.gz.b64.part02b2_4 \
+            harness/scratch/vnap-full.patch.gz.b64.part03 \
+            harness/scratch/vnap-full.patch.gz.b64.part04 \
+            harness/scratch/vnap-full.patch.gz.b64.part05 > full.patch.gz.b64
+          test "$(wc -c < full.patch.gz.b64)" -eq 26676
+          base64 -d full.patch.gz.b64 | gzip -d > full.patch
+          git -C vnap apply "$GITHUB_WORKSPACE/full.patch"
+
+          cat harness/scratch/vnap-fixes.gz.b64.* > fixes.patch.gz.b64
+          test "$(wc -c < fixes.patch.gz.b64)" -eq 8120
+          base64 -d fixes.patch.gz.b64 | gzip -d > fixes.patch
+          git -C vnap apply "$GITHUB_WORKSPACE/fixes.patch"
+
+          cat harness/scratch/vnap-runtime-review.gz.b64.* > runtime-review.patch.gz.b64
+          test "$(wc -c < runtime-review.patch.gz.b64)" -eq 2280
+          base64 -d runtime-review.patch.gz.b64 | gzip -d > runtime-review.patch
+          git -C vnap apply "$GITHUB_WORKSPACE/runtime-review.patch"
+
+          cat harness/scratch/vnap-134-update.gz.b64.* > update134.patch.gz.b64
+          test "$(wc -c < update134.patch.gz.b64)" -eq 8800
+          base64 -d update134.patch.gz.b64 | gzip -d > update134.patch
+          git -C vnap apply --check "$GITHUB_WORKSPACE/update134.patch"
+          git -C vnap apply "$GITHUB_WORKSPACE/update134.patch"
+
+          cat harness/scratch/vnap-voice-randomization.gz.b64.* > voice-random.patch.gz.b64
+          test "$(wc -c < voice-random.patch.gz.b64)" -eq 2576
+          base64 -d voice-random.patch.gz.b64 | gzip -d > voice-random.patch
+          git -C vnap apply --check "$GITHUB_WORKSPACE/voice-random.patch"
+          git -C vnap apply "$GITHUB_WORKSPACE/voice-random.patch"
+
+          sed -i 's/^mod_version=.*/mod_version=1.3.4-neoforge-1.21.1-randomized/' vnap/gradle.properties
+          sed -i 's/^neo_version=.*/neo_version=21.1.248/' vnap/gradle.properties
+          sed -i 's/^emf_version=.*/emf_version=szv0UmJn/' vnap/gradle.properties
+          sed -i 's/^etf_version=.*/etf_version=XEJeKpgJ/' vnap/gradle.properties
+          printf '\nesf_version=eafVUs7O\n' >> vnap/gradle.properties
+          sed -i '/compileOnly "maven.modrinth:BVzZfTc1:${etf_version}"/a\    compileOnly "maven.modrinth:IMuO8COj:${esf_version}"' vnap/build.gradle
+
+          grep -F 'VARIANT_SHUFFLE_BAGS' vnap/src/main/java/com/vnap/dialogue/ContextualDialogueController.java
+          grep -F 'Math.min(5, group.variants().size() - 1)' vnap/src/main/java/com/vnap/dialogue/ContextualDialogueController.java
+          python -m json.tool vnap/src/main/resources/data/villager-news-addon-port/recipe/handbook.json >/dev/null
+
+      - name: Copy full buildable source into repository
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf repo/src repo/gradle repo/tools
+          cp -a vnap/src repo/src
+          cp -a vnap/gradle repo/gradle
+          if [ -d vnap/tools ]; then cp -a vnap/tools repo/tools; fi
+          cp vnap/build.gradle repo/build.gradle
+          cp vnap/gradle.properties repo/gradle.properties
+          cp vnap/settings.gradle repo/settings.gradle
+          cp vnap/gradlew repo/gradlew
+          cp vnap/gradlew.bat repo/gradlew.bat
+          chmod +x repo/gradlew
+
+      - name: Commit imported source
+        shell: bash
+        working-directory: repo
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src gradle tools build.gradle gradle.properties settings.gradle gradlew gradlew.bat
+          if git diff --cached --quiet; then
+            echo "Source already matches verified build."
+            exit 0
+          fi
+          git commit -m "Import full verified randomized 1.3.4 NeoForge source"
+          git push origin HEAD:main
